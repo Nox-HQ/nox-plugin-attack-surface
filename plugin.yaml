@@ -1,0 +1,7 @@
+name: nox-plugin-attack-surface
+version: 0.1.0
+track: dynamic-runtime
+description: Extract HTTP endpoints and map the attack surface of your application
+tools:
+  - name: scan
+    description: Extract HTTP endpoints, detect unauthenticated routes, admin/debug exposure, file uploads, and WebSocket endpoints

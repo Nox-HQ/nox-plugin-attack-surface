@@ -20,10 +20,10 @@ var version = "dev"
 
 var (
 	// Go HTTP endpoints.
-	reGoHTTPHandle   = regexp.MustCompile(`(?:http\.HandleFunc|http\.Handle|mux\.HandleFunc|mux\.Handle|r\.HandleFunc|r\.Handle)\s*\(\s*["']([^"']+)["']`)
-	reGoGinRoute     = regexp.MustCompile(`(?:r|router|g|group|e|engine)\.\s*(GET|POST|PUT|DELETE|PATCH|HEAD|OPTIONS|Any)\s*\(\s*["']([^"']+)["']`)
-	reGoEchoRoute    = regexp.MustCompile(`(?:e|echo)\.\s*(GET|POST|PUT|DELETE|PATCH|HEAD|OPTIONS)\s*\(\s*["']([^"']+)["']`)
-	reGoChiRoute     = regexp.MustCompile(`(?:r|router)\.\s*(Get|Post|Put|Delete|Patch|Head|Options|Route)\s*\(\s*["']([^"']+)["']`)
+	reGoHTTPHandle = regexp.MustCompile(`(?:http\.HandleFunc|http\.Handle|mux\.HandleFunc|mux\.Handle|r\.HandleFunc|r\.Handle)\s*\(\s*["']([^"']+)["']`)
+	reGoGinRoute   = regexp.MustCompile(`(?:r|router|g|group|e|engine)\.\s*(GET|POST|PUT|DELETE|PATCH|HEAD|OPTIONS|Any)\s*\(\s*["']([^"']+)["']`)
+	reGoEchoRoute  = regexp.MustCompile(`(?:e|echo)\.\s*(GET|POST|PUT|DELETE|PATCH|HEAD|OPTIONS)\s*\(\s*["']([^"']+)["']`)
+	reGoChiRoute   = regexp.MustCompile(`(?:r|router)\.\s*(Get|Post|Put|Delete|Patch|Head|Options|Route)\s*\(\s*["']([^"']+)["']`)
 
 	// Python HTTP endpoints.
 	rePyFlask   = regexp.MustCompile(`@(?:app|blueprint|bp)\.\s*(?:route|get|post|put|delete|patch)\s*\(\s*["']([^"']+)["']`)
@@ -127,7 +127,7 @@ func scanFileForEndpoints(resp *sdk.ResponseBuilder, filePath, ext string) error
 	if err != nil {
 		return nil
 	}
-	defer f.Close()
+	defer func() { _ = f.Close() }()
 
 	scanner := bufio.NewScanner(f)
 	lineNum := 0
@@ -273,12 +273,17 @@ func isCommonPublicEndpoint(endpoint string) bool {
 }
 
 func main() {
+	os.Exit(run())
+}
+
+func run() int {
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt)
 	defer cancel()
 
 	srv := buildServer()
 	if err := srv.Serve(ctx); err != nil {
 		fmt.Fprintf(os.Stderr, "nox-plugin-attack-surface: %v\n", err)
-		os.Exit(1)
+		return 1
 	}
+	return 0
 }
