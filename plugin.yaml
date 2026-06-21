@@ -1,5 +1,5 @@
 name: nox-plugin-attack-surface
-version: 0.1.0
+version: 0.3.0
 track: dynamic-runtime
 description: Extract HTTP endpoints and map the attack surface of your application
 tools:
