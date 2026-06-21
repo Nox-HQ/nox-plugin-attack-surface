@@ -157,3 +157,26 @@ func findByRule(findings []*pluginv1.Finding, ruleID string) []*pluginv1.Finding
 	}
 	return result
 }
+
+func cleanDir(t *testing.T) string {
+	t.Helper()
+	_, filename, _, ok := runtime.Caller(0)
+	if !ok {
+		t.Fatal("cannot determine test file path")
+	}
+	return filepath.Join(filepath.Dir(filename), "testdata", "clean")
+}
+
+// TestCleanCodeNoEndpoints is the FP guard: non-server code (no routes/handlers)
+// must surface zero endpoints — guards against matching arbitrary code as an
+// attack-surface entry point.
+func TestCleanCodeNoEndpoints(t *testing.T) {
+	client := testClient(t)
+	resp := invokeScan(t, client, cleanDir(t))
+	if n := len(resp.GetFindings()); n != 0 {
+		for _, f := range resp.GetFindings() {
+			t.Logf("unexpected endpoint: %s at line %d", f.GetRuleId(), f.GetLocation().GetStartLine())
+		}
+		t.Fatalf("expected 0 endpoints in clean code, got %d", n)
+	}
+}
