@@ -102,7 +102,137 @@ func TestScanNoWorkspace(t *testing.T) {
 	}
 }
 
+// --- false positive regressions ---
+//
+// These cover the shapes that made the plugin fire 67 times on a Go mail server
+// with no HTTP routing: mail header reads read as endpoints, and MIME prose and
+// assertions read as file upload handling.
+
+// TestNoHeaderNamesAsEndpoints guards rule 1: a well-known HTTP/MIME header name
+// is never an endpoint, including inside files that do serve HTTP.
+func TestNoHeaderNamesAsEndpoints(t *testing.T) {
+	client := testClient(t)
+	resp := invokeScan(t, client, testdataDir(t))
+
+	for _, f := range resp.GetFindings() {
+		ep := f.GetMetadata()["endpoint"]
+		if ep == "" {
+			continue
+		}
+		if isHTTPHeaderName(ep) {
+			t.Errorf("%s reported header %q as an endpoint at %s:%d",
+				f.GetRuleId(), ep, f.GetLocation().GetFilePath(), f.GetLocation().GetStartLine())
+		}
+	}
+}
+
+// TestMailParsingHasNoEndpoints guards rule 2: a file that parses mail with
+// net/mail and imports no web framework has no HTTP attack surface.
+func TestMailParsingHasNoEndpoints(t *testing.T) {
+	client := testClient(t)
+	resp := invokeScan(t, client, filepath.Join(testdataDir(t), "clean"))
+
+	if n := len(resp.GetFindings()); n != 0 {
+		for _, f := range resp.GetFindings() {
+			t.Logf("unexpected %s at %s:%d: %s", f.GetRuleId(),
+				f.GetLocation().GetFilePath(), f.GetLocation().GetStartLine(), f.GetMessage())
+		}
+		t.Fatalf("expected 0 findings in mail/MIME code, got %d", n)
+	}
+}
+
+// TestMIMEProseIsNotFileUpload guards rule 4: the upload matcher must key off
+// HTTP form APIs, not off the word "multipart" appearing in a comment, an
+// import path or a test assertion. Test files are included here so the matcher
+// itself is under test, not the test-file policy.
+func TestMIMEProseIsNotFileUpload(t *testing.T) {
+	client := testClient(t)
+	resp := invokeScanWithInput(t, client, map[string]any{
+		"workspace_root": filepath.Join(testdataDir(t), "clean"),
+		"include_tests":  true,
+	})
+
+	if found := findByRule(resp.GetFindings(), "ATTACK-004"); len(found) != 0 {
+		for _, f := range found {
+			t.Logf("unexpected upload finding at %s:%d: %s",
+				f.GetLocation().GetFilePath(), f.GetLocation().GetStartLine(), f.GetMessage())
+		}
+		t.Fatalf("expected 0 ATTACK-004 in MIME/mail code, got %d", len(found))
+	}
+}
+
+// TestTestFilesAreSkippedByDefault guards rule 3: a route registered in a test
+// fixture is not deployed attack surface.
+func TestTestFilesAreSkippedByDefault(t *testing.T) {
+	client := testClient(t)
+	resp := invokeScan(t, client, filepath.Join(testdataDir(t), "testonly"))
+
+	if n := len(resp.GetFindings()); n != 0 {
+		t.Fatalf("expected 0 findings in test files, got %d", n)
+	}
+}
+
+// TestIncludeTestsOptIn documents the escape hatch for the policy above.
+func TestIncludeTestsOptIn(t *testing.T) {
+	client := testClient(t)
+	resp := invokeScanWithInput(t, client, map[string]any{
+		"workspace_root": filepath.Join(testdataDir(t), "testonly"),
+		"include_tests":  true,
+	})
+
+	if !hasEndpoint(resp.GetFindings(), "ATTACK-001", "/fixture/token") {
+		t.Fatal("expected the fixture route once include_tests is set")
+	}
+}
+
+// --- true positive regressions ---
+
+// TestGenuineUnauthEndpointStillFires is the recall guard: a real net/http
+// server with a registered route and no auth middleware must still be reported.
+func TestGenuineUnauthEndpointStillFires(t *testing.T) {
+	client := testClient(t)
+	resp := invokeScan(t, client, testdataDir(t))
+
+	for _, want := range []string{"/api/users", "/api/orders"} {
+		if !hasEndpoint(resp.GetFindings(), "ATTACK-001", want) {
+			t.Errorf("lost ATTACK-001 for %s", want)
+		}
+		if !hasEndpoint(resp.GetFindings(), "ATTACK-002", want) {
+			t.Errorf("lost ATTACK-002 for %s", want)
+		}
+	}
+}
+
+// TestFrameworkRoutesStillFire covers the framework extractors: a Go 1.22 mux
+// pattern, a chi router and a Flask decorator.
+func TestFrameworkRoutesStillFire(t *testing.T) {
+	client := testClient(t)
+	resp := invokeScan(t, client, testdataDir(t))
+
+	for _, want := range []string{
+		"POST /api/session",   // net/http, Go 1.22 method pattern
+		"/api/things",         // chi
+		"/api/reports",        // flask
+		"/api/products",       // express
+		"/api/reports/upload", // flask, POST decorator
+	} {
+		if !hasEndpoint(resp.GetFindings(), "ATTACK-001", want) {
+			t.Errorf("lost ATTACK-001 for %s", want)
+		}
+	}
+}
+
 // --- helpers ---
+
+// hasEndpoint reports whether a finding of ruleID carries the given endpoint.
+func hasEndpoint(findings []*pluginv1.Finding, ruleID, endpoint string) bool {
+	for _, f := range findByRule(findings, ruleID) {
+		if f.GetMetadata()["endpoint"] == endpoint {
+			return true
+		}
+	}
+	return false
+}
 
 func testdataDir(t *testing.T) string {
 	t.Helper()
@@ -137,7 +267,15 @@ func testClient(t *testing.T) pluginv1.PluginServiceClient {
 
 func invokeScan(t *testing.T, client pluginv1.PluginServiceClient, workspaceRoot string) *pluginv1.InvokeToolResponse {
 	t.Helper()
-	input, _ := structpb.NewStruct(map[string]any{"workspace_root": workspaceRoot})
+	return invokeScanWithInput(t, client, map[string]any{"workspace_root": workspaceRoot})
+}
+
+func invokeScanWithInput(t *testing.T, client pluginv1.PluginServiceClient, in map[string]any) *pluginv1.InvokeToolResponse {
+	t.Helper()
+	input, err := structpb.NewStruct(in)
+	if err != nil {
+		t.Fatal(err)
+	}
 	resp, err := client.InvokeTool(context.Background(), &pluginv1.InvokeToolRequest{
 		ToolName: "scan",
 		Input:    input,

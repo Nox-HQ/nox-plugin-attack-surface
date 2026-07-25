@@ -15,7 +15,25 @@
 
 Understanding your attack surface is the prerequisite for securing it. Most organizations cannot answer the question "how many endpoints does this service expose, and which ones lack authentication?" This plugin answers that question definitively by parsing route definitions across Go (net/http, Gin, Echo, Chi), Python (Flask, Django, FastAPI), and JavaScript/TypeScript (Express, Koa, Fastify) frameworks.
 
-The plugin uses a two-pass approach: the first pass scans the entire file for authentication middleware patterns. If no auth middleware is found in the file, every endpoint defined in that file is flagged as potentially unauthenticated (with exceptions for common public endpoints like `/health`, `/ready`, and `/ping`). This approach acknowledges that auth middleware is typically applied at the router or module level, not per-handler.
+The plugin uses a two-pass approach: the first pass establishes what the file *is* — which packages it imports, whether it is test code, and whether authentication middleware appears anywhere in it. The second pass extracts routes. If no auth middleware is found in the file, every endpoint defined in that file is flagged as potentially unauthenticated (with exceptions for common public endpoints like `/health`, `/ready`, and `/ping`). This approach acknowledges that auth middleware is typically applied at the router or module level, not per-handler.
+
+### Precision model
+
+A tool that reports 67 endpoints in a codebase with no HTTP routing trains its users to ignore it, so detection is gated on evidence rather than on keywords:
+
+- **Routing constructs, not string literals.** A route is only extracted from a registration call (`mux.HandleFunc`, `r.Get`, `@app.route`, `app.get`) in a file that actually imports `net/http` or a web framework. A `.Get("…")` call in a file that imports no web framework is not a route.
+- **Header bags are not routers.** `msg.Header.Get("Subject")` and `r.Header.Get("Authorization")` share a call shape with Chi's `r.Get("/path")`. Receivers such as `Header`, `Form`, `Query` and `Params` are excluded, and the extracted string must be shaped like a URL path.
+- **Header names are not endpoints.** `Content-Type`, `Content-Disposition`, `Subject`, `From`, `Date`, `Message-Id` and any `X-` prefixed token are rejected outright, as are MIME media types such as `multipart/mixed`.
+- **Mail parsing is not web routing.** A file that imports `net/mail`, `mime`, `mime/multipart` (or `email`/`smtplib`, or `nodemailer`/`mailparser`) and imports *no* web framework is skipped entirely.
+- **Comments and string contents are not code.** Every keyword matcher runs against source with comments removed and string literal contents blanked, across block comments, Go raw strings, JS template literals and Python docstrings. A comment describing `multipart/alternative`, an import of `mime/multipart`, and a `strings.Contains(got, "multipart/mixed")` assertion are all documentation or data, not upload handling.
+- **File upload means HTTP form APIs.** ATTACK-004 matches `FormFile`, `ParseMultipartForm`, `MultipartReader`, `request.files`, `UploadFile`, `multer(`, `busboy(`, `formidable(` — not the mere presence of the words "multipart" or "upload". `mime/multipart` on its own is MIME composition, which mail code uses constantly.
+- **Test files are not attack surface.** See below.
+
+### Test files
+
+ATTACK-001 through ATTACK-005 do **not** fire in test files by default. A route registered in an `httptest` fixture is not reachable in production, and an assertion string is not an endpoint. Test files are recognised by convention: `*_test.go`; `test_*.py`, `*_test.py`, `conftest.py`, anything under `tests/`; `*.test.*`, `*.spec.*`, and anything under `__tests__/`, `__mocks__/` or `cypress/`.
+
+Pass `include_tests: true` to the `scan` tool to inventory test code as well. Doing so lifts only the test-file policy; every other gate above still applies, so MIME assertions in a test file stay silent either way.
 
 ## Use Cases
 
@@ -143,11 +161,13 @@ The following endpoints are considered commonly public and are excluded from una
 
 ## Supported Languages / File Types
 
+Endpoint extraction requires import evidence: the file must import one of the frameworks below (or, for JS route modules that receive the router as a parameter, use a router-shaped receiver such as `app` or `router`).
+
 | Language | Extensions | Frameworks Detected |
 |----------|-----------|---------------------|
-| Go | `.go` | net/http (`HandleFunc`, `Handle`), Gin (`GET`, `POST`, etc.), Echo, Chi |
-| Python | `.py` | Flask (`@app.route`), Django (`path`, `re_path`, `url`), FastAPI (`@app.get`, etc.) |
-| JavaScript | `.js`, `.jsx` | Express (`app.get`, `router.post`), Koa (`router.get`), Fastify (`fastify.get`) |
+| Go | `.go` | net/http (`HandleFunc`, `Handle`, including Go 1.22 `"GET /path"` patterns), Gin, Echo, Chi, gorilla/mux, Fiber, httprouter, fasthttp, Beego |
+| Python | `.py` | Flask (`@app.route`), Django (`path`, `re_path`, `url`), FastAPI (`@app.get`, etc.), Starlette, Sanic, Bottle, Quart, Falcon, aiohttp, Tornado |
+| JavaScript | `.js`, `.jsx`, `.mjs`, `.cjs` | Express (`app.get`, `router.post`), Koa (`router.get`), Fastify (`fastify.get`), Hapi, NestJS, Next, restify, polka, Hono |
 | TypeScript | `.ts`, `.tsx` | Express, Koa, Fastify (same patterns as JS) |
 
 ### Cross-Language Detection
@@ -156,16 +176,23 @@ The following endpoints are considered commonly public and are excluded from una
 |---------|----------------|
 | Auth middleware | `authMiddleware`, `requireAuth`, `isAuthenticated`, `jwt.*middleware`, `passport.*`, `@login_required`, `AuthGuard`, `UseGuards`, `Depends(...auth)` |
 | Admin/debug paths | `/admin`, `/debug`, `/metrics`, `/health`, `/status`, `/internal`, `/actuator`, `/__debug__`, `/pprof`, `/swagger`, `/graphql`, `/playground` |
-| File upload | `multipart`, `FormFile`, `upload`, `multer`, `FileField`, `UploadFile`, `busboy`, `formidable` |
-| WebSocket | `websocket`, `ws://`, `wss://`, `Upgrader`, `socket.io`, `@WebSocket`, `@SubscribeMessage` |
+| File upload | Go: `.FormFile(`, `.ParseMultipartForm(`, `.MultipartReader(`, `.MultipartForm`. Python: `request.files`, `UploadFile`, `FileField(`, `MultiPartParser`. JS: `multer(`, `busboy(`, `formidable(`, `req.files`, and `.single(`/`.array(`/`.fields(` in files importing an upload library |
+| WebSocket | Go: `websocket.Upgrader`, `.Upgrade(`. Python: `websockets.serve(`, `WebSocketHandler`. JS: `new WebSocket(`, `new WebSocket.Server(`, `@WebSocketGateway`. Any language: a registered route whose path or handler names a WebSocket |
 
 ## Configuration
 
-This plugin requires no configuration.
+This plugin requires no environment configuration.
 
 | Environment Variable | Description | Default |
 |---------------------|-------------|---------|
 | _None_ | This plugin has no environment variables | -- |
+
+### Tool inputs
+
+| Input | Type | Default | Description |
+|-------|------|---------|-------------|
+| `workspace_root` | string | request workspace root | Directory to scan |
+| `include_tests` | bool | `false` | Also report findings in test files (see [Test files](#test-files)) |
 
 ## Installation
 
@@ -193,7 +220,7 @@ go build ./...
 go test ./...
 
 # Run a specific test
-go test ./... -run TestExpressEndpointExtraction
+go test ./... -run TestExtractEndpointsFindsRealRoutes
 
 # Lint
 golangci-lint run
@@ -209,19 +236,21 @@ The plugin is built on the Nox plugin SDK and communicates via the Nox plugin pr
 
 **Scan pipeline:**
 
-1. **Workspace walk** -- Recursively traverses the workspace root, skipping `.git`, `vendor`, `node_modules`, `__pycache__`, `.venv`, `dist`, and `build` directories.
+1. **Workspace walk** (`main.go`) -- Recursively traverses the workspace root, skipping `.git`, `vendor`, `node_modules`, `__pycache__`, `.venv`, `dist`, and `build` directories, plus test files unless `include_tests` is set.
 
-2. **Two-pass file analysis:**
-   - **Pass 1 (auth middleware scan):** Reads all lines and checks for authentication middleware patterns anywhere in the file. Sets a `hasAuthInFile` flag.
-   - **Pass 2 (endpoint extraction):** Iterates over each line and attempts to extract HTTP endpoint paths using framework-specific regex patterns. For each extracted endpoint, the plugin emits:
+2. **Scrubbing** (`scrub.go`) -- Each file is projected twice: once with comments removed and string contents kept (route paths live inside string literals), once with comments removed *and* string contents blanked (so prose and data can never match code patterns). The scrubber is stateful and handles block comments, Go raw strings, JS template literals and Python triple-quoted strings.
+
+3. **Two-pass file analysis** (`detect.go`):
+   - **Pass 1 (file facts):** Collects imports, classifies the file's web frameworks and mail/MIME packages, and checks for authentication middleware. A file that handles mail/MIME and imports no web framework is dropped here.
+   - **Pass 2 (per line):** Extracts routes from registration calls, validating the receiver and the path shape. For each extracted endpoint the plugin emits:
      - **ATTACK-001 (Info):** The endpoint exists.
      - **ATTACK-002 (Medium):** The endpoint appears unauthenticated (no auth middleware in file, and not a common public endpoint).
      - **ATTACK-003 (Medium):** The endpoint matches admin/debug path patterns.
-   - Additionally, each line is checked for file upload handling (ATTACK-004) and WebSocket patterns (ATTACK-005).
+   - Additionally, each non-import line is checked for HTTP file upload APIs (ATTACK-004) and WebSocket constructs (ATTACK-005), against the string-blanked projection.
 
-3. **Endpoint extraction** -- Framework-specific regex patterns extract the URL path from route definitions. The `extractEndpoint` function dispatches to the correct set of patterns based on file extension.
+4. **Output** -- Findings include the extracted endpoint path and the detected framework as metadata, enabling downstream tools to build endpoint inventories and attack surface maps.
 
-4. **Output** -- Findings include the extracted endpoint path as metadata, enabling downstream tools to build endpoint inventories and attack surface maps.
+The analysis in `detect.go` and `scrub.go` has no dependency on the SDK: every heuristic is a pure function over source text and is unit tested directly in `detect_test.go` and `scrub_test.go`, with end-to-end coverage over `testdata/` in `main_test.go`. `testdata/clean/` is the false-positive corpus and must always produce zero findings.
 
 ## Contributing
 
