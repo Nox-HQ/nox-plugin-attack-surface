@@ -21,8 +21,8 @@ func handleUpload(w http.ResponseWriter, r *http.Request) {
 	_ = file
 }
 
-func handleUsers(w http.ResponseWriter, r *http.Request) {}
-func handleOrders(w http.ResponseWriter, r *http.Request) {}
-func handleAdmin(w http.ResponseWriter, r *http.Request)  {}
-func handleDebug(w http.ResponseWriter, r *http.Request)  {}
+func handleUsers(w http.ResponseWriter, r *http.Request)   {}
+func handleOrders(w http.ResponseWriter, r *http.Request)  {}
+func handleAdmin(w http.ResponseWriter, r *http.Request)   {}
+func handleDebug(w http.ResponseWriter, r *http.Request)   {}
 func handleMetrics(w http.ResponseWriter, r *http.Request) {}

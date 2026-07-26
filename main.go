@@ -7,7 +7,6 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
-	"regexp"
 	"strings"
 
 	pluginv1 "github.com/nox-hq/nox/gen/nox/plugin/v1"
@@ -15,48 +14,6 @@ import (
 )
 
 var version = "dev"
-
-// --- Compiled regex patterns ---
-
-var (
-	// Go HTTP endpoints.
-	reGoHTTPHandle = regexp.MustCompile(`(?:http\.HandleFunc|http\.Handle|mux\.HandleFunc|mux\.Handle|r\.HandleFunc|r\.Handle)\s*\(\s*["']([^"']+)["']`)
-	reGoGinRoute   = regexp.MustCompile(`(?:r|router|g|group|e|engine)\.\s*(GET|POST|PUT|DELETE|PATCH|HEAD|OPTIONS|Any)\s*\(\s*["']([^"']+)["']`)
-	reGoEchoRoute  = regexp.MustCompile(`(?:e|echo)\.\s*(GET|POST|PUT|DELETE|PATCH|HEAD|OPTIONS)\s*\(\s*["']([^"']+)["']`)
-	reGoChiRoute   = regexp.MustCompile(`(?:r|router)\.\s*(Get|Post|Put|Delete|Patch|Head|Options|Route)\s*\(\s*["']([^"']+)["']`)
-
-	// Python HTTP endpoints.
-	rePyFlask   = regexp.MustCompile(`@(?:app|blueprint|bp)\.\s*(?:route|get|post|put|delete|patch)\s*\(\s*["']([^"']+)["']`)
-	rePyDjango  = regexp.MustCompile(`(?:path|re_path|url)\s*\(\s*["']([^"']+)["']`)
-	rePyFastAPI = regexp.MustCompile(`@(?:app|router)\.\s*(?:get|post|put|delete|patch|head|options)\s*\(\s*["']([^"']+)["']`)
-
-	// JavaScript/TypeScript HTTP endpoints.
-	reJSExpress = regexp.MustCompile(`(?:app|router)\.\s*(get|post|put|delete|patch|all|use)\s*\(\s*['"]([^'"]+)['"]`)
-	reJSKoa     = regexp.MustCompile(`(?:router)\.\s*(get|post|put|delete|patch|all)\s*\(\s*['"]([^'"]+)['"]`)
-	reJSFastify = regexp.MustCompile(`(?:fastify|server|app)\.\s*(get|post|put|delete|patch|all|route)\s*\(\s*['"]([^'"]+)['"]`)
-
-	// Auth middleware patterns.
-	reAuthMiddleware = regexp.MustCompile(`(?i)(auth.?middleware|requireAuth|isAuthenticated|authenticate|jwt.?middleware|passport\.|@login_required|@requires_auth|AuthGuard|UseGuards|Depends\(.*auth)`)
-
-	// Admin/debug endpoints.
-	reAdminDebug = regexp.MustCompile(`(?i)(/admin|/debug|/metrics|/health|/status|/internal|/actuator|/__debug__|/pprof|/swagger|/graphql|/playground)`)
-
-	// File upload handling.
-	reFileUpload = regexp.MustCompile(`(?i)(multipart|FormFile|upload|multer|FileField|UploadFile|busboy|formidable)`)
-
-	// WebSocket endpoints.
-	reWebSocket = regexp.MustCompile(`(?i)(websocket|ws://|wss://|Upgrader|socket\.io|@WebSocket|@SubscribeMessage|\.ws\(|\.websocket\()`)
-)
-
-// sourceExtensions lists file extensions to scan.
-var sourceExtensions = map[string]bool{
-	".go":  true,
-	".py":  true,
-	".js":  true,
-	".ts":  true,
-	".jsx": true,
-	".tsx": true,
-}
 
 // skippedDirs to skip during walks.
 var skippedDirs = map[string]bool{
@@ -68,6 +25,13 @@ var skippedDirs = map[string]bool{
 	"dist":         true,
 	"build":        true,
 }
+
+// maxFileBytes caps the size of a file the scanner will read; generated bundles
+// and fixtures above this are not hand-written attack surface.
+const maxFileBytes = 4 << 20
+
+// maxLineBytes is the longest single line bufio.Scanner will accept.
+const maxLineBytes = 1 << 20
 
 func buildServer() *sdk.PluginServer {
 	manifest := sdk.NewManifest("nox/attack-surface", version).
@@ -86,6 +50,7 @@ func handleScan(ctx context.Context, req sdk.ToolRequest) (*pluginv1.InvokeToolR
 	if workspaceRoot == "" {
 		workspaceRoot = req.WorkspaceRoot
 	}
+	includeTests := boolInput(req.Input["include_tests"])
 
 	resp := sdk.NewResponse()
 
@@ -107,12 +72,11 @@ func handleScan(ctx context.Context, req sdk.ToolRequest) (*pluginv1.InvokeToolR
 			return nil
 		}
 
-		ext := filepath.Ext(path)
-		if !sourceExtensions[ext] {
+		lang := languageFor(filepath.Ext(path))
+		if lang == langUnknown {
 			return nil
 		}
-
-		return scanFileForEndpoints(resp, path, ext)
+		return scanFile(resp, path, lang, includeTests)
 	})
 	if err != nil && err != context.Canceled {
 		return nil, fmt.Errorf("walking workspace: %w", err)
@@ -121,155 +85,99 @@ func handleScan(ctx context.Context, req sdk.ToolRequest) (*pluginv1.InvokeToolR
 	return resp.Build(), nil
 }
 
-// scanFileForEndpoints extracts endpoints and checks for attack surface issues.
-func scanFileForEndpoints(resp *sdk.ResponseBuilder, filePath, ext string) error {
-	f, err := os.Open(filePath)
-	if err != nil {
+// boolInput coerces a tool input value that may arrive as a bool or a string.
+func boolInput(v any) bool {
+	switch t := v.(type) {
+	case bool:
+		return t
+	case string:
+		return strings.EqualFold(t, "true") || t == "1"
+	default:
+		return false
+	}
+}
+
+// scanFile analyses one source file and emits its findings.
+func scanFile(resp *sdk.ResponseBuilder, path string, lang language, includeTests bool) error {
+	if !includeTests && isTestFile(path, lang) {
 		return nil
+	}
+	lines, err := readLines(path)
+	if err != nil {
+		return err
+	}
+	if lines == nil {
+		return nil
+	}
+
+	for _, f := range analyzeSource(path, lang, lines).findings {
+		emitFinding(resp, path, f)
+	}
+	return nil
+}
+
+// readLines reads a source file, returning nil for files that are unreadable or
+// too large to be hand-written source.
+func readLines(path string) ([]string, error) {
+	info, err := os.Stat(path)
+	if err != nil || info.Size() > maxFileBytes {
+		return nil, nil //nolint:nilerr // unreadable or oversized files are skipped, not fatal
+	}
+	f, err := os.Open(path) //nolint:gosec // scanning caller-supplied workspace paths is the plugin's job
+	if err != nil {
+		return nil, nil //nolint:nilerr // an unreadable file is not a scan failure
 	}
 	defer func() { _ = f.Close() }()
 
 	scanner := bufio.NewScanner(f)
-	lineNum := 0
+	scanner.Buffer(make([]byte, 0, 64*1024), maxLineBytes)
 
-	// Track auth middleware per file.
-	hasAuthInFile := false
 	var lines []string
-
-	// First pass: read all lines and check for auth middleware.
 	for scanner.Scan() {
-		line := scanner.Text()
-		lines = append(lines, line)
-		if reAuthMiddleware.MatchString(line) {
-			hasAuthInFile = true
-		}
+		lines = append(lines, scanner.Text())
 	}
 	if err := scanner.Err(); err != nil {
-		return err
+		return nil, nil //nolint:nilerr // truncated or binary files are skipped, not fatal
 	}
-
-	// Second pass: find endpoints.
-	for i, line := range lines {
-		lineNum = i + 1
-
-		endpoint := extractEndpoint(line, ext)
-		if endpoint != "" {
-			// ATTACK-001: HTTP endpoint detected.
-			resp.Finding(
-				"ATTACK-001",
-				sdk.SeverityInfo,
-				sdk.ConfidenceHigh,
-				fmt.Sprintf("HTTP endpoint detected: %s", endpoint),
-			).
-				At(filePath, lineNum, lineNum).
-				WithMetadata("endpoint", endpoint).
-				Done()
-
-			// ATTACK-002: Check if endpoint lacks auth.
-			if !hasAuthInFile && !isCommonPublicEndpoint(endpoint) {
-				resp.Finding(
-					"ATTACK-002",
-					sdk.SeverityMedium,
-					sdk.ConfidenceMedium,
-					fmt.Sprintf("Potentially unauthenticated endpoint: %s", endpoint),
-				).
-					At(filePath, lineNum, lineNum).
-					WithMetadata("endpoint", endpoint).
-					Done()
-			}
-
-			// ATTACK-003: Admin/debug endpoint.
-			if reAdminDebug.MatchString(endpoint) {
-				resp.Finding(
-					"ATTACK-003",
-					sdk.SeverityMedium,
-					sdk.ConfidenceHigh,
-					fmt.Sprintf("Admin/debug endpoint exposed: %s", endpoint),
-				).
-					At(filePath, lineNum, lineNum).
-					WithMetadata("endpoint", endpoint).
-					Done()
-			}
-		}
-
-		// ATTACK-004: File upload handling.
-		if reFileUpload.MatchString(line) {
-			resp.Finding(
-				"ATTACK-004",
-				sdk.SeverityLow,
-				sdk.ConfidenceMedium,
-				fmt.Sprintf("File upload handling detected: %s", strings.TrimSpace(line)),
-			).
-				At(filePath, lineNum, lineNum).
-				Done()
-		}
-
-		// ATTACK-005: WebSocket endpoint.
-		if reWebSocket.MatchString(line) {
-			resp.Finding(
-				"ATTACK-005",
-				sdk.SeverityMedium,
-				sdk.ConfidenceMedium,
-				fmt.Sprintf("WebSocket endpoint detected: %s", strings.TrimSpace(line)),
-			).
-				At(filePath, lineNum, lineNum).
-				Done()
-		}
-	}
-
-	return nil
+	return lines, nil
 }
 
-// extractEndpoint tries to extract an HTTP endpoint path from a line.
-func extractEndpoint(line, ext string) string {
-	switch ext {
-	case ".go":
-		if m := reGoHTTPHandle.FindStringSubmatch(line); len(m) > 1 {
-			return m[1]
-		}
-		if m := reGoGinRoute.FindStringSubmatch(line); len(m) > 2 {
-			return m[2]
-		}
-		if m := reGoEchoRoute.FindStringSubmatch(line); len(m) > 2 {
-			return m[2]
-		}
-		if m := reGoChiRoute.FindStringSubmatch(line); len(m) > 2 {
-			return m[2]
-		}
-	case ".py":
-		if m := rePyFlask.FindStringSubmatch(line); len(m) > 1 {
-			return m[1]
-		}
-		if m := rePyDjango.FindStringSubmatch(line); len(m) > 1 {
-			return m[1]
-		}
-		if m := rePyFastAPI.FindStringSubmatch(line); len(m) > 1 {
-			return m[1]
-		}
-	case ".js", ".ts", ".jsx", ".tsx":
-		if m := reJSExpress.FindStringSubmatch(line); len(m) > 2 {
-			return m[2]
-		}
-		if m := reJSKoa.FindStringSubmatch(line); len(m) > 2 {
-			return m[2]
-		}
-		if m := reJSFastify.FindStringSubmatch(line); len(m) > 2 {
-			return m[2]
-		}
+// emitFinding maps an analysis result onto the SDK finding model.
+func emitFinding(resp *sdk.ResponseBuilder, path string, f rawFinding) {
+	severity, confidence, message := describe(f)
+
+	fb := resp.Finding(f.rule, severity, confidence, message).
+		At(path, f.line, f.line)
+	if f.endpoint != "" {
+		fb = fb.WithMetadata("endpoint", f.endpoint)
 	}
-	return ""
+	if f.framework != "" {
+		fb = fb.WithMetadata("framework", f.framework)
+	}
+	fb.Done()
 }
 
-// isCommonPublicEndpoint returns true for endpoints that are commonly public.
-func isCommonPublicEndpoint(endpoint string) bool {
-	public := []string{"/health", "/healthz", "/ready", "/readyz", "/ping", "/version", "/", "/favicon.ico", "/robots.txt"}
-	lower := strings.ToLower(endpoint)
-	for _, p := range public {
-		if lower == p {
-			return true
-		}
+// describe returns the severity, confidence and message for a finding.
+func describe(f rawFinding) (pluginv1.Severity, pluginv1.Confidence, string) {
+	switch f.rule {
+	case ruleEndpoint:
+		return sdk.SeverityInfo, sdk.ConfidenceHigh,
+			fmt.Sprintf("HTTP endpoint detected: %s", f.endpoint)
+	case ruleUnauth:
+		return sdk.SeverityMedium, sdk.ConfidenceMedium,
+			fmt.Sprintf("Potentially unauthenticated endpoint: %s", f.endpoint)
+	case ruleAdminDebug:
+		return sdk.SeverityMedium, sdk.ConfidenceHigh,
+			fmt.Sprintf("Admin/debug endpoint exposed: %s", f.endpoint)
+	case ruleUpload:
+		return sdk.SeverityLow, sdk.ConfidenceMedium,
+			fmt.Sprintf("File upload handling detected: %s", f.evidence)
+	case ruleWebSocket:
+		return sdk.SeverityMedium, sdk.ConfidenceMedium,
+			fmt.Sprintf("WebSocket endpoint detected: %s", f.evidence)
+	default:
+		return sdk.SeverityInfo, sdk.ConfidenceLow, f.rule
 	}
-	return false
 }
 
 func main() {
