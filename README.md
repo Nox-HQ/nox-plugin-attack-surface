@@ -1,5 +1,7 @@
 # nox-plugin-attack-surface
 
+[![nox security grade](.github/nox-badge.svg)](https://github.com/nox-hq/nox)
+
 **Extract HTTP endpoints and map the attack surface of your application.**
 
 <!-- badges -->
